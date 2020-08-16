@@ -2,6 +2,7 @@
 import datetime
 import logging
 import math
+import platform
 
 from multiprocessing.util import Finalize
 
@@ -11,6 +12,7 @@ from celery.beat import Scheduler, ScheduleEntry
 from celery.utils.encoding import safe_str, safe_repr
 from celery.utils.log import get_logger
 from celery.utils.time import maybe_make_aware
+from celery.signals import beat_init
 from kombu.utils.json import dumps, loads
 
 from django.conf import settings
@@ -239,6 +241,9 @@ class DatabaseScheduler(Scheduler):
             or self.app.conf.beat_max_loop_interval
             or DEFAULT_MAX_INTERVAL)
 
+        self.use_beat_lock = kwargs['app'].conf.get('BEAT_REDIS_LOCK', False)
+        self.beat_lock_interval = kwargs['app'].conf.get('BEAT_REDIS_LOCK_INTERVAL', 5)
+
     def setup_schedule(self):
         self.install_default_entries(self.schedule)
         self.update_from_dict(self.app.conf.beat_schedule)
@@ -372,3 +377,32 @@ class DatabaseScheduler(Scheduler):
                     repr(entry) for entry in self._schedule.values()),
                 )
         return self._schedule
+
+    def close(self):
+        logger.debug("Releasing beat lock")
+        self.beat_lock.release()
+
+        super().close()
+
+    def tick(self, min=min, **kwargs):
+        # Always extend lock
+        if self.use_beat_lock:
+            self.beat_lock.extend(self.beat_lock_interval)
+            logger.debug(f"beat lock extended for {self.beat_lock_interval}")
+
+        upcoming_tasks = [d.is_due()[1] for d in self.schedule.values()]
+
+        return min(upcoming_tasks + [self.beat_lock_interval])
+
+@beat_init.connect
+def acquire_beat_runner_lock(sender=None, **kwargs):
+    if sender.scheduler.use_beat_lock:
+        logger.debug("CELERY_BEAT_REDIS_LOCK configured. Acquiring beat worker lock...")
+
+        # kombu already has redis client, no need for us to set it up ourselves
+        lock_interval = sender.scheduler.beat_lock_interval
+        redis_client = sender.app.broker_connection().channel().client
+        beat_lock = redis_client.lock("django_celery_beat:beat_lock", timeout=lock_interval, sleep=lock_interval)
+        beat_lock.acquire(token=platform.node())
+
+        sender.scheduler.beat_lock = beat_lock
